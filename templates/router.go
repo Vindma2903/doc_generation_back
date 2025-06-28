@@ -2,7 +2,9 @@ package templates
 
 import (
 	"database/sql"
+	"fmt"
 	"github.com/goccy/go-json"
+
 	"log"
 	"net/http"
 	"regexp"
@@ -10,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 func RegisterTemplateRoutes(r *gin.Engine) {
@@ -26,6 +29,17 @@ func RegisterTemplateRoutes(r *gin.Engine) {
 	r.PUT("/tags/:id", updateTagHandler)
 	r.POST("/templates/styles", createTemplateStyleHandler)
 	r.GET("/templates/:id/styles", getTemplateStylesHandler)
+	r.POST("/templates/style", createTemplateStyleHandler)
+	r.POST("/templates/:id/auto-assign-style-ids", autoAssignStyleIDsHandler)
+
+	r.POST("/tags/auto-assign-style-ids", func(c *gin.Context) {
+		if err := AutoAssignStyleIDs(); err != nil {
+			log.Println("❌ Ошибка автоназначения style_id:", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении style_id"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"message": "✅ style_id успешно назначены"})
+	})
 
 }
 
@@ -184,10 +198,17 @@ func updateTemplateContentHandler(c *gin.Context) {
 
 	log.Printf("🔁 Обновление контента шаблона ID=%d, длина контента=%d\n", req.ID, len(req.Content))
 
+	// 1. Обновляем сам шаблон в базе
 	if err := UpdateTemplateContent(req.ID, req.Content); err != nil {
 		log.Printf("❌ Ошибка обновления контента шаблона ID=%d: %v\n", req.ID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении контента"})
 		return
+	}
+
+	// 2. Назначаем style_id всем {{тегам}}, у которых он отсутствует
+	if err := AutoAssignStyleIDsToTemplate(req.ID, req.Content); err != nil {
+		log.Printf("⚠️ Ошибка автоназначения style_id для шаблона ID=%d: %v\n", req.ID, err)
+		// Не прерываем выполнение — шаблон уже обновлён, можно дать soft-warning
 	}
 
 	log.Printf("✅ Контент шаблона ID=%d успешно обновлён\n", req.ID)
@@ -352,12 +373,24 @@ func CreateTemplateStyleWithScope(templateID int, selector string, styles map[st
 		return err
 	}
 
+	var fontSizePt *int = nil
+	if fontSizeRaw, ok := styles["font-size"]; ok {
+		if fontSizeStr, ok := fontSizeRaw.(string); ok {
+			// Убираем "px" и парсим как целое число
+			pxStr := strings.TrimSuffix(fontSizeStr, "px")
+			if pxInt, err := strconv.Atoi(pxStr); err == nil {
+				fontSizePt = &pxInt
+			}
+		}
+	}
+
 	_, err = db.Exec(`
-		INSERT INTO template_styles (template_id, selector, styles, scope)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO template_styles (template_id, selector, styles, scope, font_size_pt)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (template_id, selector, scope) DO UPDATE
-		SET styles = EXCLUDED.styles
-	`, templateID, selector, stylesJSON, scope)
+		SET styles = EXCLUDED.styles,
+		    font_size_pt = EXCLUDED.font_size_pt
+	`, templateID, selector, stylesJSON, scope, fontSizePt)
 
 	if err != nil {
 		log.Println("❌ SQL Exec error:", err)
@@ -374,4 +407,61 @@ func toKebabCaseStyle(input map[string]interface{}) map[string]interface{} {
 		result[strings.ToLower(kebabKey)] = v
 	}
 	return result
+}
+
+func AutoAssignStyleIDsToTemplate(templateID int, html string) error {
+	re := regexp.MustCompile(`{{(.*?)}}`)
+	matches := re.FindAllStringSubmatch(html, -1)
+
+	for _, m := range matches {
+		tagName := m[1]
+
+		var styleID sql.NullString
+		err := db.QueryRow(`SELECT style_id FROM tags WHERE name = $1`, tagName).Scan(&styleID)
+		if err != nil {
+			continue
+		}
+
+		if !styleID.Valid {
+			newID := uuid.New().String()
+
+			_, err = db.Exec(`UPDATE tags SET style_id = $1 WHERE name = $2`, newID, tagName)
+			if err != nil {
+				return err
+			}
+
+			selector := fmt.Sprintf(`span[data-style-id="%s"]`, newID)
+			defaultStyles := map[string]interface{}{"font-size": "14px"}
+
+			if err := CreateTemplateStyleWithScope(templateID, selector, defaultStyles, "inline"); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func autoAssignStyleIDsHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	templateID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Некорректный ID"})
+		return
+	}
+
+	var req struct {
+		HTML string `json:"html"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный JSON"})
+		return
+	}
+
+	if err := AutoAssignStyleIDsToTemplate(templateID, req.HTML); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка автоназначения style_id"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "✅ style_id назначены"})
 }

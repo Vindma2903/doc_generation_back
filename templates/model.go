@@ -129,6 +129,7 @@ type Tag struct {
 	Label       string    `json:"label" db:"label"`
 	Description string    `json:"description" db:"description"`
 	Type        string    `json:"type" db:"type"` // 👈 новое поле
+	StyleID     *string   `json:"style_id"`
 }
 
 // CreateTag создает новый тег в таблице tags
@@ -150,7 +151,7 @@ func CreateTag(name, label, description, tagType string) (*Tag, error) {
 
 // GetAllTags возвращает все теги из таблицы tags
 func GetAllTags() ([]Tag, error) {
-	rows, err := db.Query(`SELECT id, name, label, description, type, created_at FROM tags ORDER BY name`)
+	rows, err := db.Query(`SELECT id, name, label, description, type, created_at, style_id FROM tags ORDER BY name`)
 	if err != nil {
 		return nil, err
 	}
@@ -166,6 +167,7 @@ func GetAllTags() ([]Tag, error) {
 			&t.Description,
 			&t.Type, // 👈 добавлено считывание типа
 			&t.CreatedAt,
+			&t.StyleID,
 		)
 		if err != nil {
 			return nil, err
@@ -257,4 +259,23 @@ func GetStylesByTemplateID(templateID int) ([]TemplateStyle, error) {
 		result = append(result, s)
 	}
 	return result, nil
+}
+
+func AutoAssignStyleIDs() error {
+	query := `
+		WITH matches AS (
+			SELECT
+				t.id AS tag_id,
+				REGEXP_MATCHES(tmp.content, 'data-style-id="([a-f0-9\\-]{36})">[^<]*{{' || t.name || '}}', 'g') AS style_match
+			FROM tags t
+			JOIN templates tmp ON tmp.content ILIKE '%' || '{{' || t.name || '}}' || '%'
+		)
+		UPDATE tags
+		SET style_id = style_match[1]::uuid
+		FROM matches
+		WHERE tags.id = matches.tag_id
+		  AND style_match IS NOT NULL
+	`
+	_, err := db.Exec(query)
+	return err
 }

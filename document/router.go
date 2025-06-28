@@ -1,12 +1,22 @@
 package document
 
 import (
+	"baliance.com/gooxml/document"
+
 	"database/sql"
+	"fmt"
+	"golang.org/x/net/html"
 	"log"
 	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
+	"baliance.com/gooxml/measurement"
 	"github.com/gin-gonic/gin"
 	// Импорт модели из текущего пакета, так как файл model.go тоже в пакете `document`
 	// НЕ нужно использовать alias вроде `model`, можно вызывать напрямую
@@ -21,6 +31,9 @@ func RegisterDocumentRoutes(r *gin.Engine) {
 	r.GET("/documents/:id/data", GetDocumentDataHandler)
 	r.POST("/documents/:id/data", SaveDocumentFieldHandler)
 	r.GET("/documents/user/:id", GetDocumentsByUserHandler)
+	r.POST("/documents/:id/export-word", ExportDocumentToWordHandler)
+	r.GET("/documents/:id/export", ExportDocxHandler)
+	r.GET("/documents/:id/export-docx", ExportDocxHandler)
 
 }
 
@@ -252,4 +265,196 @@ func GetDocumentsByUserHandler(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, documents)
+}
+
+func ExportDocumentToWordHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Некорректный ID"})
+		return
+	}
+
+	// Получаем rendered_content из БД
+	row := db.QueryRow(`SELECT rendered_content FROM documents WHERE id = $1`, id)
+	var rendered sql.NullString
+	if err := row.Scan(&rendered); err != nil || !rendered.Valid {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Документ не найден или пуст"})
+		return
+	}
+
+	// Создаём временный HTML-файл
+	tmpDir := os.TempDir()
+	htmlPath := filepath.Join(tmpDir, fmt.Sprintf("document_%d.html", id))
+	docxPath := filepath.Join(tmpDir, fmt.Sprintf("document_%d.docx", id))
+
+	if err := os.WriteFile(htmlPath, []byte(rendered.String), 0644); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка записи HTML"})
+		return
+	}
+
+	// Вызываем Pandoc
+	cmd := exec.Command("pandoc", htmlPath, "-o", docxPath)
+	if err := cmd.Run(); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка вызова pandoc"})
+		return
+	}
+
+	// Отправляем файл пользователю
+	c.FileAttachment(docxPath, fmt.Sprintf("document_%d.docx", id))
+
+	// (необязательно) удаляем временные файлы — если хочешь подчистить
+	// defer os.Remove(htmlPath)
+	// defer os.Remove(docxPath)
+}
+
+func ConvertHTMLToWord(doc *document.Document, htmlStr string, styleMap map[string]int) error {
+	root, err := html.Parse(strings.NewReader(htmlStr))
+	if err != nil {
+		return err
+	}
+
+	var walk func(n *html.Node, p document.Paragraph)
+
+	walk = func(n *html.Node, p document.Paragraph) {
+		switch {
+		case n.Type == html.ElementNode && n.Data == "p":
+			p = doc.AddParagraph()
+
+			for _, attr := range n.Attr {
+				if attr.Key == "style" {
+					if indent := parseIndent(attr.Val); indent > 0 {
+						p.Properties().SetFirstLineIndent(measurement.Distance(indent))
+					}
+				}
+			}
+
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c, p)
+			}
+
+		case n.Type == html.ElementNode && n.Data == "span":
+			run := p.AddRun()
+			var styleID string
+			for _, attr := range n.Attr {
+				if attr.Key == "data-style-id" {
+					styleID = attr.Val
+					break
+				}
+			}
+			if pt, ok := styleMap[styleID]; ok && pt > 0 {
+				run.Properties().SetSize(measurement.Distance(pt * 2))
+			}
+
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				if c.Type == html.TextNode {
+					run.AddText(c.Data)
+				} else {
+					walk(c, p)
+				}
+			}
+
+		case n.Type == html.TextNode:
+			p.AddRun().AddText(n.Data)
+
+		default:
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c, p)
+			}
+		}
+	}
+
+	walk(root, document.Paragraph{}) // пустой старт
+	return nil
+}
+
+func GenerateDocxFromRendered(documentID int, renderedHTML string) (string, error) {
+	doc := document.New()
+
+	// Получаем карту styleID → font_size_pt
+	styleMap, err := GetFontSizesByDocumentID(documentID)
+	if err != nil {
+		return "", fmt.Errorf("ошибка получения размеров шрифта: %w", err)
+	}
+
+	if err := ConvertHTMLToWord(doc, renderedHTML, styleMap); err != nil {
+		return "", fmt.Errorf("ошибка генерации Word-документа: %w", err)
+	}
+
+	outputDir := "exports"
+	if err := os.MkdirAll(outputDir, os.ModePerm); err != nil {
+		return "", fmt.Errorf("ошибка создания директории: %w", err)
+	}
+
+	filename := fmt.Sprintf("document_%d.docx", documentID)
+	path := filepath.Join(outputDir, filename)
+
+	if err := doc.SaveToFile(path); err != nil {
+		return "", fmt.Errorf("ошибка сохранения docx: %w", err)
+	}
+
+	return path, nil
+}
+
+func ExportDocxHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Некорректный ID"})
+		return
+	}
+
+	row := db.QueryRow(`SELECT rendered_content FROM documents WHERE id = $1`, id)
+	var rendered sql.NullString
+	if err := row.Scan(&rendered); err != nil || !rendered.Valid {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Документ не найден или пуст"})
+		return
+	}
+
+	path, err := GenerateDocxFromRendered(id, rendered.String)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка создания docx"})
+		return
+	}
+
+	c.FileAttachment(path, fmt.Sprintf("document_%d.docx", id))
+}
+
+// Парсит text-indent: 5.25em и возвращает значение в twips (1/20 pt)
+func parseIndent(style string) int {
+	re := regexp.MustCompile(`text-indent:\s*([\d.]+)em`)
+	matches := re.FindStringSubmatch(style)
+	if len(matches) >= 2 {
+		em, _ := strconv.ParseFloat(matches[1], 64)
+		return int(em * 20 * 12) // эм × 12pt × 20 (в twips)
+	}
+	return 0
+}
+
+func GetFontSizesByDocumentID(docID int) (map[string]int, error) {
+	rows, err := db.Query(`
+		SELECT ts.selector, ts.font_size_pt
+		FROM template_styles ts
+		JOIN documents d ON ts.template_id = d.template_id
+		WHERE d.id = $1 AND ts.scope = 'inline'
+	`, docID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	styleMap := make(map[string]int)
+	re := regexp.MustCompile(`data-style-id="([^"]+)"`)
+
+	for rows.Next() {
+		var selector string
+		var size int
+		if err := rows.Scan(&selector, &size); err == nil {
+			if matches := re.FindStringSubmatch(selector); len(matches) == 2 {
+				styleID := matches[1]
+				styleMap[styleID] = size
+			}
+		}
+	}
+	return styleMap, nil
 }

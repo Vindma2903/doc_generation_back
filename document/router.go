@@ -34,6 +34,7 @@ func RegisterDocumentRoutes(r *gin.Engine) {
 	r.POST("/documents/:id/export-word", ExportDocumentToWordHandler)
 	r.GET("/documents/:id/export", ExportDocxHandler)
 	r.GET("/documents/:id/export-docx", ExportDocxHandler)
+	r.GET("/documents/:id/export-pdf", ExportPdfHandler)
 
 }
 
@@ -325,6 +326,7 @@ func ConvertHTMLToWord(doc *document.Document, htmlStr string, styleMap map[stri
 				if attr.Key == "style" {
 					if indent := parseIndent(attr.Val); indent > 0 {
 						p.Properties().SetFirstLineIndent(measurement.Distance(indent))
+						fmt.Printf("📎 Отступ (indent): %d twips\n", indent)
 					}
 				}
 			}
@@ -342,13 +344,22 @@ func ConvertHTMLToWord(doc *document.Document, htmlStr string, styleMap map[stri
 					break
 				}
 			}
-			if pt, ok := styleMap[styleID]; ok && pt > 0 {
-				run.Properties().SetSize(measurement.Distance(pt * 2))
+
+			if styleID != "" {
+				if pt, ok := styleMap[styleID]; ok && pt > 0 {
+					run.Properties().SetSize(measurement.Distance(pt * 2))
+					fmt.Printf("✅ span[data-style-id=\"%s\"] → %dpt (size=%d half-points)\n", styleID, pt, pt*2)
+				} else {
+					fmt.Printf("⚠️ Не найден размер для style-id: %s\n", styleID)
+				}
+			} else {
+				fmt.Println("⚠️ span без data-style-id")
 			}
 
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
 				if c.Type == html.TextNode {
 					run.AddText(c.Data)
+					fmt.Printf("📝 Текст: \"%s\"\n", c.Data)
 				} else {
 					walk(c, p)
 				}
@@ -356,6 +367,7 @@ func ConvertHTMLToWord(doc *document.Document, htmlStr string, styleMap map[stri
 
 		case n.Type == html.TextNode:
 			p.AddRun().AddText(n.Data)
+			fmt.Printf("📝 Обычный текст (вне span): \"%s\"\n", n.Data)
 
 		default:
 			for c := n.FirstChild; c != nil; c = c.NextSibling {
@@ -457,4 +469,57 @@ func GetFontSizesByDocumentID(docID int) (map[string]int, error) {
 		}
 	}
 	return styleMap, nil
+}
+
+func ExportPdfHandler(c *gin.Context) {
+	idStr := c.Param("id")
+	id, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Некорректный ID"})
+		return
+	}
+
+	// Получаем оригинальный HTML из поля `content`
+	var content sql.NullString
+	err = db.QueryRow(`SELECT content FROM documents WHERE id = $1`, id).Scan(&content)
+	if err != nil || !content.Valid {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Документ не найден или пуст"})
+		return
+	}
+
+	// Создаём временные файлы
+	tmpDir := os.TempDir()
+	htmlPath := filepath.Join(tmpDir, fmt.Sprintf("document_%d.html", id))
+	pdfPath := filepath.Join(tmpDir, fmt.Sprintf("document_%d.pdf", id))
+
+	// Формируем полный HTML с указанием кодировки
+	htmlContent := fmt.Sprintf(`
+	<!DOCTYPE html>
+	<html lang="ru">
+	<head>
+	  <meta charset="UTF-8">
+	  <title>Документ %d</title>
+	</head>
+	<body>
+	%s
+	</body>
+	</html>
+	`, id, content.String)
+
+	// Сохраняем сформированный HTML во временный файл
+	if err := os.WriteFile(htmlPath, []byte(htmlContent), 0644); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка записи HTML"})
+		return
+	}
+
+	// Генерация PDF через wkhtmltopdf
+	cmd := exec.Command("wkhtmltopdf", htmlPath, pdfPath)
+	if err := cmd.Run(); err != nil {
+		log.Printf("❌ wkhtmltopdf error: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка генерации PDF (wkhtmltopdf)"})
+		return
+	}
+
+	// Отдаём PDF клиенту
+	c.FileAttachment(pdfPath, fmt.Sprintf("document_%d.pdf", id))
 }

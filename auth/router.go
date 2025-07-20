@@ -1,8 +1,10 @@
 package auth
 
 import (
+	"database/sql"
 	"fmt"
 	"log"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -28,6 +30,8 @@ func RegisterRoutes(r *gin.Engine) {
 	r.POST("/invite", AuthMiddleware(), inviteHandler)
 	r.POST("/set-password", setPasswordHandler)
 	r.GET("/api/users", AuthMiddleware(), getAllUsersHandler)
+	r.POST("/roles/rename", renameRoleHandler)
+	r.POST("/roles/delete", deleteRoleHandler)
 
 	// ✅ защищённые маршруты через группу
 	authGroup := r.Group("/")
@@ -36,6 +40,10 @@ func RegisterRoutes(r *gin.Engine) {
 	authGroup.GET("/auth/check", checkAuthHandler)
 	authGroup.GET("/users/invited", getInvitedUsersHandler)
 	authGroup.POST("/users/assign-role", assignRoleHandler)
+	r.GET("/api/roles", AuthMiddleware(), getAllRolesHandler)
+	authGroup.POST("/users/:id/block", blockUserHandler)
+	authGroup.DELETE("/users/:id", deleteUserHandler)
+	authGroup.POST("/users/:id/unblock", unblockUserHandler)
 
 }
 
@@ -117,6 +125,16 @@ type RegisterRequest struct {
 	LastName  string `json:"last_name"`
 	Email     string `json:"email"`
 	Password  string `json:"password"`
+	Role      string `json:"role"`
+}
+
+func getOrCreateRoleID(roleName string) (int, error) {
+	var id int
+	err := db.QueryRow(`SELECT id FROM roles WHERE name = $1`, roleName).Scan(&id)
+	if err == sql.ErrNoRows {
+		err = db.QueryRow(`INSERT INTO roles (name) VALUES ($1) RETURNING id`, roleName).Scan(&id)
+	}
+	return id, err
 }
 
 func registerHandler(c *gin.Context) {
@@ -162,8 +180,25 @@ func registerHandler(c *gin.Context) {
 	}
 	isOwner := userCount == 0
 
-	log.Printf("%s ℹ️ Регистрация нового пользователя: %s %s (%s), организация ID: %d, is_owner=%v\n",
-		time.Now().Format("2006/01/02 15:04:05"), req.FirstName, req.LastName, req.Email, orgID, isOwner)
+	// 🧠 Устанавливаем роль по умолчанию
+	if req.Role == "" {
+		if isOwner {
+			req.Role = "Владелец"
+		} else {
+			req.Role = "Сотрудник"
+		}
+	}
+
+	// 👉 Получаем или создаём ID роли
+	roleID, err := getOrCreateRoleID(req.Role)
+	if err != nil {
+		log.Printf("%s ❌ Ошибка при получении ID роли %s: %v\n", time.Now().Format("2006/01/02 15:04:05"), req.Role, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обработке роли"})
+		return
+	}
+
+	log.Printf("%s ℹ️ Регистрация нового пользователя: %s %s (%s), организация ID: %d, is_owner=%v, role_id=%d\n",
+		time.Now().Format("2006/01/02 15:04:05"), req.FirstName, req.LastName, req.Email, orgID, isOwner, roleID)
 
 	err = createUserWithVerification(
 		req.FirstName,
@@ -174,6 +209,7 @@ func registerHandler(c *gin.Context) {
 		verificationExpires,
 		orgID,
 		isOwner,
+		roleID, // 👈 теперь передаём числовой ID
 	)
 	if err != nil {
 		log.Printf("%s ❌ Ошибка при создании пользователя: %v\n", time.Now().Format("2006/01/02 15:04:05"), err)
@@ -372,6 +408,7 @@ func AuthMiddleware() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Неверный формат user_id"})
 			return
 		}
+		userID := int(userIDFloat)
 
 		session, err := getSessionByToken(tokenStr)
 		if err != nil {
@@ -386,12 +423,25 @@ func AuthMiddleware() gin.HandlerFunc {
 		}
 		if session.ExpiresAt.Before(time.Now()) {
 			log.Printf("%s ❌ Сессия с токеном %s истекла в %v\n", time.Now().Format("2006/01/02 15:04:05"), tokenStr, session.ExpiresAt)
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Сессия недействительна"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Сессия истекла"})
 			return
 		}
 
-		log.Printf("%s ✅ Успешная аутентификация пользователя с ID %d\n", time.Now().Format("2006/01/02 15:04:05"), int(userIDFloat))
-		c.Set("user_id", int(userIDFloat))
+		// 🔒 Проверка блокировки пользователя
+		user, err := getUserByID(userID)
+		if err != nil {
+			log.Printf("%s ❌ Ошибка при получении пользователя ID=%d: %v\n", time.Now().Format("2006/01/02 15:04:05"), userID, err)
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Пользователь не найден"})
+			return
+		}
+		if user.IsBlocked {
+			log.Printf("%s 🚫 Пользователь ID=%d заблокирован\n", time.Now().Format("2006/01/02 15:04:05"), userID)
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Пользователь заблокирован"})
+			return
+		}
+
+		log.Printf("%s ✅ Успешная аутентификация пользователя с ID %d\n", time.Now().Format("2006/01/02 15:04:05"), userID)
+		c.Set("user_id", userID)
 		c.Next()
 	}
 }
@@ -471,7 +521,7 @@ func checkAuthHandler(c *gin.Context) {
 func generateTokens(userID int) (string, string, error) {
 	accessToken := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
 		"user_id": userID,
-		"exp":     time.Now().Add(15 * time.Minute).Unix(), // короткоживущий
+		"exp":     time.Now().Add(2 * time.Hour).Unix(),
 	})
 	accessTokenStr, err := accessToken.SignedString(jwtSecret)
 	if err != nil {
@@ -552,28 +602,30 @@ func inviteHandler(c *gin.Context) {
 		return
 	}
 
-	// 🔐 Получаем ID текущего пользователя
 	inviterID := c.GetInt("user_id")
-	log.Printf("Получен inviterID из контекста: %d\n", inviterID)
-
 	if inviterID == 0 {
 		log.Printf("inviterID == 0, пользователь не авторизован или id не установлен в контекст\n")
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Пользователь не авторизован"})
 		return
 	}
 
-	// 🔎 Получаем пригласителя (авторизованного пользователя)
 	inviter, err := getUserByID(inviterID)
 	if err != nil {
 		log.Printf("Ошибка получения пользователя по ID %d: %v\n", inviterID, err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении пользователя"})
 		return
 	}
-	log.Printf("Пригласитель: ID=%d, OrgID=%d\n", inviter.ID, inviter.OrganizationID)
-
 	if inviter.OrganizationID == 0 {
 		log.Printf("Организация не найдена для пользователя ID=%d\n", inviterID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Организация не найдена для текущего пользователя"})
+		return
+	}
+
+	// 👉 Получаем или создаём роль по имени
+	roleID, err := getOrCreateRoleID(req.Role)
+	if err != nil {
+		log.Printf("Ошибка при получении ID роли %s: %v\n", req.Role, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обработке роли"})
 		return
 	}
 
@@ -582,7 +634,7 @@ func inviteHandler(c *gin.Context) {
 	expires := time.Now().Add(24 * time.Hour)
 	log.Printf("Создан токен приглашения: %s, срок действия до: %s\n", token, expires.Format(time.RFC3339))
 
-	// ✅ Создаём приглашённого пользователя (не владелец)
+	// ✅ Создаём пользователя
 	err = createUserWithVerification(
 		req.FirstName,
 		req.LastName,
@@ -592,6 +644,7 @@ func inviteHandler(c *gin.Context) {
 		expires,
 		inviter.OrganizationID,
 		false, // is_owner = false
+		roleID,
 	)
 	if err != nil {
 		log.Printf("Ошибка при создании пользователя: %v\n", err)
@@ -600,7 +653,6 @@ func inviteHandler(c *gin.Context) {
 	}
 	log.Printf("Пользователь с email %s создан и приглашение сохранено в базе\n", req.Email)
 
-	// ✉ Отправляем приглашение
 	err = sendInvitationEmail(req.Email, token)
 	if err != nil {
 		log.Printf("Ошибка при отправке письма: %v\n", err)
@@ -757,7 +809,22 @@ func getInvitedUsersHandler(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, users)
+	// 🎯 Формируем результат с нужными полями
+	var result []gin.H
+	for _, u := range users {
+		result = append(result, gin.H{
+			"ID":            u.ID,
+			"FirstName":     u.FirstName,
+			"LastName":      u.LastName,
+			"Email":         u.Email,
+			"EmailVerified": u.EmailVerified,
+			"IsOwner":       u.IsOwner,
+			"Role":          u.RoleName,
+			"IsBlocked":     u.IsBlocked, // ✅ добавьте эту строку
+		})
+	}
+
+	c.JSON(http.StatusOK, result)
 }
 
 type AssignRoleRequest struct {
@@ -765,41 +832,74 @@ type AssignRoleRequest struct {
 	Role    string `json:"role"`     // новая роль: "Менеджер", "Администратор", "Владелец" и т.д.
 }
 
+type Role struct {
+	ID   int    `json:"id"`
+	Name string `json:"name"`
+}
+
 func assignRoleHandler(c *gin.Context) {
 	var req AssignRoleRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		log.Printf("Ошибка разбора JSON: %v\n", err)
+		log.Printf("❌ Ошибка разбора JSON: %v\n", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат запроса"})
 		return
 	}
 
-	// 🔐 Получаем ID текущего пользователя
+	// 🔐 Авторизованный пользователь
 	adminID := c.GetInt("user_id")
 	admin, err := getUserByID(adminID)
 	if err != nil {
-		log.Printf("Ошибка получения текущего пользователя: %v\n", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении данных пользователя"})
+		log.Printf("❌ Ошибка получения администратора ID=%d: %v\n", adminID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка авторизации"})
 		return
 	}
 
-	// 🔒 Проверяем, что он имеет право менять роли
-	if !admin.IsOwner && admin.Role != "Администратор" {
+	// 🔒 Только владелец (1) или админ (2) имеют право менять роли
+	if admin.RoleID != 1 && admin.RoleID != 2 {
+		log.Printf("⛔ Недостаточно прав: user_id=%d, role_id=%d\n", admin.ID, admin.RoleID)
 		c.JSON(http.StatusForbidden, gin.H{"error": "Недостаточно прав для назначения ролей"})
 		return
 	}
 
-	// ✅ Обновляем роли пользователей
+	// ⚠️ Проверка: нельзя назначить пустую роль
+	if req.Role == "" || len(req.UserIDs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Не указана роль или список пользователей"})
+		return
+	}
+
+	// ✅ Создаём роль при необходимости
+	roleID, err := ensureRoleExists(req.Role)
+	if err != nil {
+		log.Printf("❌ Ошибка при проверке/создании роли %s: %v\n", req.Role, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обработке роли"})
+		return
+	}
+
+	// 🧠 Только один владелец
+	if req.Role == "Владелец" {
+		existingOwner, err := findUserByRole("Владелец")
+		if err == nil && existingOwner != nil {
+			for _, userID := range req.UserIDs {
+				if existingOwner.ID != userID {
+					c.JSON(http.StatusBadRequest, gin.H{"error": "Роль 'Владелец' уже назначена другому пользователю"})
+					return
+				}
+			}
+		}
+	}
+
+	// ✅ Назначаем роль всем пользователям
 	for _, userID := range req.UserIDs {
 		err := updateUserRole(userID, req.Role)
 		if err != nil {
-			log.Printf("Ошибка при обновлении роли для пользователя ID=%d: %v\n", userID, err)
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при обновлении ролей"})
+			log.Printf("❌ Ошибка при обновлении роли для пользователя ID=%d: %v\n", userID, err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось обновить роль пользователя"})
 			return
 		}
 	}
 
-	log.Printf("✅ Назначена роль %s для пользователей: %v\n", req.Role, req.UserIDs)
-	c.JSON(http.StatusOK, gin.H{"message": "Роли успешно обновлены"})
+	log.Printf("✅ Назначена роль '%s' (ID=%d) пользователям: %v\n", req.Role, roleID, req.UserIDs)
+	c.JSON(http.StatusOK, gin.H{"message": "Роль успешно обновлена"})
 }
 
 func getAllUsersHandler(c *gin.Context) {
@@ -814,9 +914,245 @@ func getAllUsersHandler(c *gin.Context) {
 		result = append(result, gin.H{
 			"id":       u.ID,
 			"name":     fmt.Sprintf("%s %s", u.FirstName, u.LastName),
-			"position": u.Role, // Можно подставить роль как "должность"
+			"position": u.RoleName, // ✅ теперь мы используем название роли
 		})
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+func findUserByRole(roleName string) (*User, error) {
+	row := db.QueryRow(`
+		SELECT u.id, u.email, u.first_name, u.last_name, u.role_id, r.name
+		FROM users u
+		JOIN roles r ON r.id = u.role_id
+		WHERE r.name = $1
+		LIMIT 1
+	`, roleName)
+
+	var user User
+	err := row.Scan(&user.ID, &user.Email, &user.FirstName, &user.LastName, &user.RoleID, &user.RoleName)
+	if err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func getAllRolesHandler(c *gin.Context) {
+	rows, err := db.Query("SELECT id, name FROM roles")
+	if err != nil {
+		log.Printf("Ошибка при получении ролей: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при получении ролей"})
+		return
+	}
+	defer rows.Close()
+
+	var roles []Role
+	for rows.Next() {
+		var role Role
+		if err := rows.Scan(&role.ID, &role.Name); err != nil {
+			log.Printf("Ошибка при чтении строки роли: %v", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при чтении данных роли"})
+			return
+		}
+		roles = append(roles, role)
+	}
+
+	c.JSON(http.StatusOK, roles)
+}
+
+func ensureRoleExists(roleName string) (int, error) {
+	var roleID int
+	err := db.QueryRow("SELECT id FROM roles WHERE name = $1", roleName).Scan(&roleID)
+	if err == sql.ErrNoRows {
+		// роли нет — создаём
+		err = db.QueryRow("INSERT INTO roles (name) VALUES ($1) RETURNING id", roleName).Scan(&roleID)
+	}
+	return roleID, err
+}
+
+func renameRoleHandler(c *gin.Context) {
+	var req RenameRoleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("Ошибка разбора JSON: %v\n", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат запроса"})
+		return
+	}
+
+	// Проверка существования старой роли
+	var roleID int
+	err := db.QueryRow("SELECT id FROM roles WHERE name = $1", req.OldName).Scan(&roleID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Роль не найдена"})
+		return
+	} else if err != nil {
+		log.Printf("Ошибка при поиске роли: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при проверке роли"})
+		return
+	}
+
+	// Обновление имени роли
+	_, err = db.Exec("UPDATE roles SET name = $1 WHERE id = $2", req.NewName, roleID)
+	if err != nil {
+		log.Printf("Ошибка при переименовании роли: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось переименовать роль"})
+		return
+	}
+
+	log.Printf("✅ Роль '%s' переименована в '%s'\n", req.OldName, req.NewName)
+	c.JSON(http.StatusOK, gin.H{"message": "Роль успешно переименована"})
+}
+
+func deleteRoleHandler(c *gin.Context) {
+	var req DeleteRoleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		log.Printf("Ошибка разбора JSON: %v\n", err)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный формат запроса"})
+		return
+	}
+
+	// Проверяем, существует ли роль
+	var roleID int
+	err := db.QueryRow("SELECT id FROM roles WHERE name = $1", req.Name).Scan(&roleID)
+	if err == sql.ErrNoRows {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Роль не найдена"})
+		return
+	} else if err != nil {
+		log.Printf("Ошибка при поиске роли: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при проверке роли"})
+		return
+	}
+
+	// Проверка: никто не должен использовать эту роль
+	var userCount int
+	err = db.QueryRow("SELECT COUNT(*) FROM users WHERE role_id = $1", roleID).Scan(&userCount)
+	if err != nil {
+		log.Printf("Ошибка при проверке использования роли: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось проверить роль"})
+		return
+	}
+	if userCount > 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Нельзя удалить роль, которая назначена пользователям"})
+		return
+	}
+
+	// Удаляем роль
+	_, err = db.Exec("DELETE FROM roles WHERE id = $1", roleID)
+	if err != nil {
+		log.Printf("Ошибка при удалении роли: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось удалить роль"})
+		return
+	}
+
+	log.Printf("🗑️ Роль '%s' удалена\n", req.Name)
+	c.JSON(http.StatusOK, gin.H{"message": "Роль успешно удалена"})
+}
+
+func blockUserHandler(c *gin.Context) {
+	adminID := c.GetInt("user_id")
+	admin, err := getUserByID(adminID)
+	if err != nil {
+		log.Printf("❌ Ошибка получения администратора ID=%d: %v\n", adminID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка авторизации"})
+		return
+	}
+
+	log.Printf("👤 Попытка блокировки: AdminID=%d, RoleID=%d, RoleName=%s, IsOwner=%v\n",
+		admin.ID, admin.RoleID, admin.RoleName, admin.IsOwner)
+
+	// ✅ Только Владелец (1) и Администратор (2)
+	if admin.RoleID != 1 && admin.RoleID != 2 {
+		log.Printf("⛔ Недостаточно прав: RoleID=%d\n", admin.RoleID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Недостаточно прав"})
+		return
+	}
+
+	userIDStr := c.Param("id")
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil {
+		log.Printf("❌ Неверный ID пользователя: %s\n", userIDStr)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный ID"})
+		return
+	}
+
+	err = setUserBlockedStatus(userID, true)
+	if err != nil {
+		log.Printf("❌ Ошибка при блокировке пользователя ID=%d: %v\n", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось заблокировать пользователя"})
+		return
+	}
+
+	log.Printf("✅ Пользователь ID=%d успешно заблокирован\n", userID)
+	c.JSON(http.StatusOK, gin.H{"message": "Пользователь заблокирован"})
+}
+
+func deleteUserHandler(c *gin.Context) {
+	adminID := c.GetInt("user_id")
+	admin, err := getUserByID(adminID)
+	if err != nil || (!admin.IsOwner && admin.RoleName != "Администратор") {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Недостаточно прав"})
+		return
+	}
+
+	userIDStr := c.Param("id")
+	userID, err := strconv.Atoi(userIDStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Неверный ID"})
+		return
+	}
+
+	// нельзя удалить самого себя
+	if adminID == userID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Нельзя удалить самого себя"})
+		return
+	}
+
+	_, err = db.Exec("DELETE FROM users WHERE id = $1", userID)
+	if err != nil {
+		log.Printf("❌ Ошибка при удалении пользователя ID=%d: %v\n", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Не удалось удалить пользователя"})
+		return
+	}
+
+	log.Printf("🗑️ Пользователь ID=%d успешно удалён\n", userID)
+	c.JSON(http.StatusOK, gin.H{"message": "Пользователь удалён"})
+}
+
+func unblockUserHandler(c *gin.Context) {
+	adminID := c.GetInt("user_id")
+	admin, err := getUserByID(adminID)
+	if err != nil {
+		log.Printf("❌ Ошибка получения администратора ID=%d: %v\n", adminID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка авторизации"})
+		return
+	}
+
+	// 🐞 Логируем данные о текущем пользователе
+	log.Printf("👤 Попытка разблокировки: AdminID=%d, RoleID=%d, RoleName=%s, IsOwner=%v\n",
+		admin.ID, admin.RoleID, admin.RoleName, admin.IsOwner)
+
+	// ✅ Только Владелец (1) и Администратор (2)
+	if admin.RoleID != 1 && admin.RoleID != 2 {
+		log.Printf("⛔ Недостаточно прав: RoleID=%d\n", admin.RoleID)
+		c.JSON(http.StatusForbidden, gin.H{"error": "Недостаточно прав"})
+		return
+	}
+
+	userIDParam := c.Param("id")
+	userID, err := strconv.Atoi(userIDParam)
+	if err != nil || userID == 0 {
+		log.Printf("❌ Некорректный ID пользователя: %s\n", userIDParam)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Некорректный ID пользователя"})
+		return
+	}
+
+	_, err = db.Exec("UPDATE users SET is_blocked = FALSE WHERE id = $1", userID)
+	if err != nil {
+		log.Printf("❌ Ошибка при разблокировке пользователя ID=%d: %v\n", userID, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Ошибка при разблокировке"})
+		return
+	}
+
+	log.Printf("✅ Пользователь ID=%d успешно разблокирован\n", userID)
+	c.JSON(http.StatusOK, gin.H{"message": "Пользователь разблокирован"})
 }
